@@ -1,0 +1,22 @@
+{
+  "name": "harness",
+  "displayName": "Orchestration Harness",
+  "version": "0.1.0",
+  "description": "Multi-agent orchestration harness: a frontier-model orchestrator plans and governs while smaller delegatee agents execute packets, with a deterministic CLI as the sole ledger writer enforcing states, gates, escalations, and monotone metrics. The model proposes; the machine disposes.",
+  "author": {
+    "name": "Saurav Varma",
+    "url": "https://github.com/sauravvarma"
+  },
+  "homepage": "https://github.com/sauravvarma/harness",
+  "repository": "https://github.com/sauravvarma/harness",
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "multi-agent",
+    "delegation",
+    "event-sourced",
+    "deterministic",
+    "gates",
+    "token-efficiency"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "harness",
+  "description": "Multi-agent orchestration harness for Claude Code: frontier orchestrator, cheap delegatees, deterministic spine. One opinionated tool, one audited codebase.",
+  "owner": {
+    "name": "Saurav Varma",
+    "url": "https://github.com/sauravvarma"
+  },
+  "plugins": [
+    {
+      "name": "harness",
+      "description": "Orchestrator loop (conduct skill), roster agents (cartographer, builder, critic, verifier, integrator), digest Stop-hook, and the harness CLI kernel.",
+      "source": "./"
+    }
+  ]
+}

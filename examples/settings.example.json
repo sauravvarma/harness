@@ -1,0 +1,16 @@
+{
+  "comment": "Example wiring for a harness-managed project that does NOT use the plugin (the plugin registers this hook automatically via hooks/hooks.json). Copy relevant parts into the project's .claude/settings.json. The Stop hook makes the digest protocol self-enforcing for builder agents (HARNESS_TASK is set in the builder's spawn environment).",
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/harness/hooks/stop_digest_gate.py"
+          }
+        ]
+      }
+    ]
+  }
+}
