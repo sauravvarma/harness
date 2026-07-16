@@ -16,7 +16,8 @@ Design doc (v1.3, three adversarial review rounds): `~/vault/projects/orchestrat
 - **Typed escalations**: needs-decision, contract-conflict, scope-discovery, budget-exceeded. Escalated tasks cannot be re-dispatched until a decision is recorded.
 - **Monotone metrics** (the generalized ratchet): registered with a direction (`down` for migration burndown, `up` for a growth corpus) and a counting command; every integration checks all of them and blocks on violation.
 - **Contract versioning**: amendments bump versions and emit REVERIFY events for affected tasks (tier-aware: PROVISIONAL reverifies pre-integration tasks, FROZEN reverifies everything).
-- **Structural refusals**: repo lease at init (single operator, loud failure); genesis mode blocks dispatch until a human-ratified charter and one passing corpus scenario exist.
+- **Structural refusals**: repo lease at init (single operator, loud failure); genesis mode blocks dispatch until a human-ratified charter and one passing corpus scenario exist; ui_surface tasks cannot dispatch without a registered direction artifact.
+- **The taste layer (v0.2)**: taste is routed and enforced, never held, by the kernel. `ui_surface` tasks require the design-critic gate, rendered evidence in the digest, and human-verify items; `direction_adjacent` tasks additionally require a recorded pairwise pick (`harness pick`). Integration blocks on unacknowledged digest flags (`harness flag-ack`), unresolved human-verify items (`harness human-verify`), and missing picks. A human-verify FAIL routes to `harness reopen`. `harness metrics` reports critic-vs-human calibration disagreements so /improve can tune (or demote) the design-critic on evidence.
 - **Telemetry from the ledger**: `harness metrics` computes rework, escalation mix, gate catch rates, checkout count, and zero-catch (rubber-stamp) suspects. Nothing is recalled; everything is derived.
 
 ## Install
@@ -75,8 +76,8 @@ Tests: `python3 -m unittest discover -s tests`.
 
 - Worktree lifecycle automation (dispatch-time branching, mechanical pre-merge rebase, interaction-failure blame procedure): protocol specified in design v1.1, currently the integrator agent's manual discipline.
 - Main-drift PAUSED/re-baseline (`harness rebase`).
-- HUMAN-VERIFY gate type as first-class events.
-- The /improve skill (capture exists via ledger; distillation flow pending).
+- The /improve skill (capture exists via ledger, including calibration telemetry; distillation flow pending).
+- Deterministic taste linters registered per project (slop detector, palette validator); motion-lint deliberately deferred until run evidence says which linter hurts most.
 - Idempotent Stop-hook resubmission hardening.
 
-Status: kernel v0 at N=0 real runs. The next milestone is one real STANDARD-mode run; per the council ruling, that outranks everything else.
+Status: kernel v0.2 after two real runs (personal-site, aval) and a forensic post-mortem; the taste layer (HUMAN-VERIFY, flag triage, pairwise picks, design-critic, direction artifacts, calibration telemetry) is the direct product of those runs' failure classes.

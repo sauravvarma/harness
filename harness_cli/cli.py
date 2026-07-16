@@ -51,6 +51,7 @@ TRANSITIONS = {
     ("escalated", "dispatched"),
     ("in_gate", "dispatched"),
     ("in_gate", "done"),
+    ("done", "dispatched"),
     ("done", "integrated"),
     ("integrated", "deployed"),
 }
@@ -217,6 +218,15 @@ def latest_escalation_seq(events, task):
     return seq
 
 
+def latest_done_digest(events, task):
+    """Returns (seq, digest dict) of the most recent accepted done digest."""
+    found = (None, None)
+    for e in events:
+        if e["ev"] == "DIGEST" and e["task"] == task and e.get("status") == "done":
+            found = (e["seq"], e.get("digest", {}))
+    return found
+
+
 def decision_after(events, task, seq):
     return any(
         e["ev"] == "DECISION" and e.get("task") == task and e["seq"] > seq for e in events
@@ -329,6 +339,12 @@ def cmd_plan(args):
         for g in t.get("extra_gates", []):
             if g in GATE_FLOOR:
                 raise HarnessError("task %s: %s is a floor gate, not an extra gate" % (tid, g))
+        if t.get("direction_adjacent") and not t.get("ui_surface"):
+            raise HarnessError("task %s: direction_adjacent implies ui_surface" % tid)
+        if t.get("ui_surface") and "design-critic" not in t.get("extra_gates", []):
+            raise HarnessError(
+                "task %s: ui_surface tasks must carry the design-critic extra gate" % tid
+            )
         for c in t.get("contracts", []):
             if c not in known_contracts and c not in new_contracts:
                 raise HarnessError("task %s references undefined contract %s" % (tid, c))
@@ -363,6 +379,8 @@ def cmd_plan(args):
             "contracts": t.get("contracts", []),
             "extra_gates": t.get("extra_gates", []),
             "dep_gate": t.get("dep_gate", "integrated"),
+            "ui_surface": bool(t.get("ui_surface")),
+            "direction_adjacent": bool(t.get("direction_adjacent")),
         })
     print("planned %d task(s) in wave %s: %s" % (len(new_ids), wave, ", ".join(new_ids)))
 
@@ -398,6 +416,12 @@ def cmd_dispatch(args):
     defs = task_defs(events)
     if tid not in defs:
         raise HarnessError("task %s is not planned" % tid)
+    if defs[tid].get("ui_surface"):
+        da = manifest(root).get("direction_artifact")
+        if not da or not (root / da).exists():
+            raise HarnessError(
+                "structural refusal: ui_surface task %s requires a direction artifact; register one with `harness direction <path>`" % tid
+            )
     state = derive_states(events).get(tid)
 
     if state == "planned":
@@ -451,7 +475,7 @@ def cmd_run_acceptance(args):
     print("acceptance passed for %s (attempt %d)" % (tid, attempt))
 
 
-def _validate_digest(root, events, tid, digest):
+def _validate_digest(root, events, tid, digest, tdef):
     problems = []
     if digest.get("task") != tid:
         problems.append("digest task field (%s) does not match %s" % (digest.get("task"), tid))
@@ -466,6 +490,21 @@ def _validate_digest(root, events, tid, digest):
         report = digest.get("report")
         if not report or not (root / report).exists():
             problems.append("done digest needs a report path that exists")
+        if tdef.get("ui_surface"):
+            evidence = digest.get("evidence")
+            if not isinstance(evidence, list) or not evidence:
+                problems.append("ui_surface done digest needs a non-empty evidence list (rendered screenshots/video)")
+            else:
+                for p in evidence:
+                    if not (root / p).exists():
+                        problems.append("evidence path missing: %s" % p)
+            hv = digest.get("human_verify")
+            if not isinstance(hv, list) or not hv or not all(
+                isinstance(i, dict) and i.get("item") for i in hv
+            ):
+                problems.append(
+                    "ui_surface done digest needs a human_verify list of {item, expected} entries"
+                )
     elif status is not None:
         if not digest.get("detail"):
             problems.append("escalation digest needs a detail field")
@@ -480,10 +519,13 @@ def cmd_digest(args):
     root = find_root()
     events = read_events(root)
     tid = args.task
+    defs = task_defs(events)
+    if tid not in defs:
+        raise HarnessError("task %s is not planned" % tid)
     if derive_states(events).get(tid) != "dispatched":
         raise HarnessError("task %s is not dispatched; a digest closes an active dispatch" % tid)
     digest = load_json(Path(args.file), "digest")
-    problems = _validate_digest(root, events, tid, digest)
+    problems = _validate_digest(root, events, tid, digest, defs[tid])
     if problems:
         append_event(root, {"ev": "DIGEST_REJECTED", "task": tid, "problems": problems})
         raise HarnessError("digest rejected: " + "; ".join(problems))
@@ -499,6 +541,9 @@ def cmd_digest(args):
         return
 
     set_state(root, events, tid, "in_gate")
+    if digest.get("human_verify"):
+        append_event(root, {"ev": "HUMAN_VERIFY_REQUESTED", "task": tid, "attempt": attempt,
+                            "items": [i["item"] for i in digest["human_verify"]]})
     append_event(root, {"ev": "GATE_RESULT", "task": tid, "attempt": attempt,
                         "gate": "digest-valid", "result": "pass"})
     acc_ok = any(
@@ -633,12 +678,122 @@ def cmd_metric(args):
         raise HarnessError("metric action must be register or check")
 
 
+def cmd_direction(args):
+    root = find_root()
+    if not (root / args.path).exists():
+        raise HarnessError("direction artifact not found: %s" % args.path)
+    m = manifest(root)
+    m["direction_artifact"] = args.path
+    save_manifest(root, m)
+    append_event(root, {"ev": "DIRECTION_SET", "path": args.path})
+    print("direction artifact registered: %s" % args.path)
+
+
+def cmd_human_verify(args):
+    root = find_root()
+    events = read_events(root)
+    tid = args.task
+    seq, digest = latest_done_digest(events, tid)
+    if seq is None:
+        raise HarnessError("task %s has no accepted done digest" % tid)
+    items = digest.get("human_verify", [])
+    if not (0 <= args.item < len(items)):
+        raise HarnessError("task %s has %d human-verify items; index %d is out of range"
+                           % (tid, len(items), args.item))
+    append_event(root, {"ev": "HUMAN_VERIFY_RESULT", "task": tid, "item_index": args.item,
+                        "item": items[args.item]["item"], "passed": args.passed,
+                        "note": args.note or "", "digest_seq": seq})
+    print("human-verify item %d for %s: %s" % (args.item, tid, "pass" if args.passed else "FAIL"))
+
+
+def cmd_flag_ack(args):
+    root = find_root()
+    events = read_events(root)
+    tid = args.task
+    seq, digest = latest_done_digest(events, tid)
+    if seq is None:
+        raise HarnessError("task %s has no accepted done digest" % tid)
+    flags = digest.get("flags", [])
+    if not (0 <= args.flag < len(flags)):
+        raise HarnessError("task %s has %d flags; index %d is out of range"
+                           % (tid, len(flags), args.flag))
+    append_event(root, {"ev": "FLAG_ACK", "task": tid, "flag_index": args.flag,
+                        "flag": flags[args.flag], "resolution": args.resolution,
+                        "note": args.note or "", "digest_seq": seq})
+    print("flag %d on %s acknowledged: %s" % (args.flag, tid, args.resolution))
+
+
+def cmd_pick(args):
+    root = find_root()
+    events = read_events(root)
+    if args.task not in task_defs(events):
+        raise HarnessError("task %s is not planned" % args.task)
+    options = [o.strip() for o in args.options.split("|") if o.strip()]
+    if len(options) < 2:
+        raise HarnessError("pick needs at least two options (separate with |)")
+    if args.choice not in options:
+        raise HarnessError("choice %r is not among the options %s" % (args.choice, options))
+    append_event(root, {"ev": "PICK", "task": args.task, "options": options,
+                        "choice": args.choice, "note": args.note or ""})
+    print("pick recorded for %s: %s" % (args.task, args.choice))
+
+
+def cmd_reopen(args):
+    root = find_root()
+    events = read_events(root)
+    tid = args.task
+    if derive_states(events).get(tid) != "done":
+        raise HarnessError("task %s is not done; reopen returns a done task to rework" % tid)
+    append_event(root, {"ev": "REOPENED", "task": tid, "reason": args.reason or ""})
+    events = read_events(root)
+    set_state(root, events, tid, "dispatched")
+    print("reopened %s for rework" % tid)
+
+
+def _integration_holds(root, events, tid, tdef):
+    """Human-judgment holds that block integration. Returns a list of reasons."""
+    holds = []
+    seq, digest = latest_done_digest(events, tid)
+    if seq is None:
+        return ["no accepted done digest"]
+
+    flags = digest.get("flags", [])
+    acked = {e["flag_index"] for e in events
+             if e["ev"] == "FLAG_ACK" and e["task"] == tid and e.get("digest_seq") == seq}
+    unacked = [i for i in range(len(flags)) if i not in acked]
+    if unacked:
+        holds.append("unacknowledged flags %s (use `harness flag-ack %s --flag N --resolution ...`)"
+                     % (unacked, tid))
+
+    hv = digest.get("human_verify", [])
+    latest_result = {}
+    for e in events:
+        if e["ev"] == "HUMAN_VERIFY_RESULT" and e["task"] == tid and e.get("digest_seq") == seq:
+            latest_result[e["item_index"]] = e["passed"]
+    pending = [i for i in range(len(hv)) if i not in latest_result]
+    failed = [i for i in range(len(hv)) if latest_result.get(i) is False]
+    if pending:
+        holds.append("human-verify items pending: %s" % pending)
+    if failed:
+        holds.append("human-verify items FAILED: %s (fix and `harness reopen %s`, or re-verify)"
+                     % (failed, tid))
+
+    if tdef.get("direction_adjacent"):
+        if not any(e["ev"] == "PICK" and e["task"] == tid for e in events):
+            holds.append("direction_adjacent task has no recorded pairwise pick (`harness pick %s ...`)" % tid)
+    return holds
+
+
 def cmd_integrate(args):
     root = find_root()
     events = read_events(root)
     tid = args.task
     if derive_states(events).get(tid) != "done":
         raise HarnessError("task %s is not done; only done tasks integrate" % tid)
+    holds = _integration_holds(root, events, tid, task_defs(events)[tid])
+    if holds:
+        append_event(root, {"ev": "INTEGRATION_BLOCKED", "task": tid, "holds": holds})
+        raise HarnessError("integration blocked for %s: %s" % (tid, "; ".join(holds)))
     m = manifest(root)
     failed = []
     for mid in sorted(m["metrics"]):
@@ -781,6 +936,18 @@ def cmd_metrics(args):
         if g not in MACHINE_GATES and r["fail"] == 0 and done_count >= 20
     ]
 
+    hv_results = [e for e in events if e["ev"] == "HUMAN_VERIFY_RESULT"]
+    picks = sum(1 for e in events if e["ev"] == "PICK")
+    flag_acks = [e for e in events if e["ev"] == "FLAG_ACK"]
+
+    # Calibration: tasks where the design-critic passed but a human later failed
+    # a human-verify item. This is the judge-vs-human disagreement signal.
+    critic_passed = {e["task"] for e in events
+                     if e["ev"] == "GATE_RESULT" and e["gate"] == "design-critic"
+                     and e["result"] == "pass"}
+    human_failed = {e["task"] for e in hv_results if not e["passed"]}
+    disagreements = sorted(critic_passed & human_failed)
+
     out = {
         "tasks": len(defs),
         "by_state": by_state,
@@ -791,6 +958,20 @@ def cmd_metrics(args):
         "checkouts": sum(1 for e in events if e["ev"] == "CHECKOUT"),
         "reverify_pending": sum(1 for e in events if e["ev"] == "REVERIFY"),
         "zero_catch_suspects": zero_catch,
+        "human_verify": {
+            "passed": sum(1 for e in hv_results if e["passed"]),
+            "failed": sum(1 for e in hv_results if not e["passed"]),
+        },
+        "picks": picks,
+        "flags": {
+            "acked": len(flag_acks),
+            "resolutions": {r: sum(1 for e in flag_acks if e["resolution"] == r)
+                            for r in ("ok", "escalated", "new-task")},
+        },
+        "calibration": {
+            "design_critic_gated_tasks": len(critic_passed),
+            "critic_pass_human_fail": disagreements,
+        },
     }
     print(json.dumps(out, indent=2))
 
@@ -896,6 +1077,38 @@ def build_parser():
     sp.add_argument("path")
     sp.add_argument("--reason", default="")
     sp.set_defaults(fn=cmd_checkout)
+
+    sp = sub.add_parser("direction", help="register the direction artifact required by ui_surface tasks")
+    sp.add_argument("path")
+    sp.set_defaults(fn=cmd_direction)
+
+    sp = sub.add_parser("human-verify", help="record an operator result for a digest's human-verify item")
+    sp.add_argument("task")
+    sp.add_argument("--item", type=int, required=True)
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pass", dest="passed", action="store_true")
+    g.add_argument("--fail", dest="passed", action="store_false")
+    sp.add_argument("--note", default="")
+    sp.set_defaults(fn=cmd_human_verify)
+
+    sp = sub.add_parser("flag-ack", help="acknowledge a digest flag before integration")
+    sp.add_argument("task")
+    sp.add_argument("--flag", type=int, required=True)
+    sp.add_argument("--resolution", required=True, choices=["ok", "escalated", "new-task"])
+    sp.add_argument("--note", default="")
+    sp.set_defaults(fn=cmd_flag_ack)
+
+    sp = sub.add_parser("pick", help="record an operator's pairwise pick for a direction-adjacent task")
+    sp.add_argument("task")
+    sp.add_argument("--options", required=True, help="pipe-separated, e.g. 'variant-a|variant-b'")
+    sp.add_argument("--choice", required=True)
+    sp.add_argument("--note", default="")
+    sp.set_defaults(fn=cmd_pick)
+
+    sp = sub.add_parser("reopen", help="return a done task to rework (e.g. after a human-verify fail)")
+    sp.add_argument("task")
+    sp.add_argument("--reason", default="")
+    sp.set_defaults(fn=cmd_reopen)
 
     sp = sub.add_parser("status", help="derived state table")
     sp.set_defaults(fn=cmd_status)

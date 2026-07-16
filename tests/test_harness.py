@@ -247,6 +247,121 @@ class TestLifecycle(HarnessBase):
         self.assertEqual(json.loads(rr.stdout)["reverify_pending"], 1)
 
 
+UI_PLAN = {
+    "wave": 1,
+    "contracts": {"C1": {"tier": "PROVISIONAL", "text": "demo"}},
+    "tasks": [
+        {"id": "U1", "goal": "hero tile rework", "deps": [], "acceptance": ["true"],
+         "contracts": ["C1"], "ui_surface": True, "direction_adjacent": True,
+         "extra_gates": ["design-critic"]},
+    ],
+}
+
+
+class TestTasteLayer(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+
+    def plan_ui(self):
+        write_json(self.root / "plan.json", UI_PLAN)
+        self.ok(["plan", "plan.json"])
+
+    def submit_ui_digest(self, task, flags=None, with_evidence=True, with_hv=True):
+        report = self.root / ".harness" / "reports" / ("%s.md" % task)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("report\n")
+        d = {"task": task, "status": "done", "changed": ["x.scss"],
+             "contracts": {"C1": 1}, "flags": flags or [],
+             "report": ".harness/reports/%s.md" % task}
+        if with_evidence:
+            shot = self.root / ".harness" / "reports" / ("%s-shot.png" % task)
+            shot.write_bytes(b"png")
+            d["evidence"] = [".harness/reports/%s-shot.png" % task]
+        if with_hv:
+            d["human_verify"] = [{"item": "sound feels calm", "expected": "no machine-gun plops"}]
+        path = self.root / ".harness" / "digests" / ("%s.json" % task)
+        write_json(path, d)
+        return str(path.relative_to(self.root))
+
+    def test_ui_task_requires_design_critic_gate(self):
+        bad = {"tasks": [{"id": "U9", "goal": "ui", "deps": [], "acceptance": ["true"],
+                          "ui_surface": True}]}
+        write_json(self.root / "plan.json", bad)
+        r = harness(["plan", "plan.json"], self.root)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("design-critic", r.stderr)
+
+    def test_direction_adjacent_implies_ui_surface(self):
+        bad = {"tasks": [{"id": "U9", "goal": "ui", "deps": [], "acceptance": ["true"],
+                          "direction_adjacent": True}]}
+        write_json(self.root / "plan.json", bad)
+        r = harness(["plan", "plan.json"], self.root)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("implies ui_surface", r.stderr)
+
+    def test_ui_dispatch_requires_direction_artifact(self):
+        self.plan_ui()
+        self.fail(["dispatch", "U1", "--agent", "b1"], "direction artifact")
+        (self.root / "DIRECTION.md").write_text("anchor + dials + ban list\n")
+        self.ok(["direction", "DIRECTION.md"])
+        self.ok(["dispatch", "U1", "--agent", "b1"])
+
+    def test_ui_digest_requires_evidence_and_human_verify(self):
+        self.plan_ui()
+        (self.root / "DIRECTION.md").write_text("d\n")
+        self.ok(["direction", "DIRECTION.md"])
+        self.ok(["dispatch", "U1", "--agent", "b1"])
+        self.ok(["run-acceptance", "U1"])
+        rel = self.submit_ui_digest("U1", with_evidence=False)
+        self.fail(["digest", "U1", rel], "evidence")
+        rel = self.submit_ui_digest("U1", with_hv=False)
+        self.fail(["digest", "U1", rel], "human_verify")
+
+    def test_integration_holds_flags_hv_and_pick(self):
+        self.plan_ui()
+        (self.root / "DIRECTION.md").write_text("d\n")
+        self.ok(["direction", "DIRECTION.md"])
+        self.ok(["dispatch", "U1", "--agent", "b1"])
+        self.ok(["run-acceptance", "U1"])
+        rel = self.submit_ui_digest("U1", flags=["portal transitions downgraded to cuts"])
+        self.ok(["digest", "U1", rel])
+        self.ok(["gate", "U1", "critic", "pass"])
+        self.ok(["gate", "U1", "verifier", "pass"])
+        self.ok(["gate", "U1", "design-critic", "pass", "--reason", "matches anchor"])
+        self.assertEqual(self.state_of("U1"), "done")
+
+        self.fail(["integrate", "U1"], "unacknowledged flags")
+        self.ok(["flag-ack", "U1", "--flag", "0", "--resolution", "escalated",
+                 "--note", "quality downgrade goes to decision"])
+        self.fail(["integrate", "U1"], "human-verify items pending")
+        self.ok(["human-verify", "U1", "--item", "0", "--pass"])
+        self.fail(["integrate", "U1"], "no recorded pairwise pick")
+        self.ok(["pick", "U1", "--options", "variant-a|variant-b", "--choice", "variant-a"])
+        self.ok(["integrate", "U1"])
+        self.assertEqual(self.state_of("U1"), "integrated")
+
+    def test_human_verify_fail_blocks_and_reopen_reworks(self):
+        self.plan_ui()
+        (self.root / "DIRECTION.md").write_text("d\n")
+        self.ok(["direction", "DIRECTION.md"])
+        self.ok(["dispatch", "U1", "--agent", "b1"])
+        self.ok(["run-acceptance", "U1"])
+        rel = self.submit_ui_digest("U1")
+        self.ok(["digest", "U1", rel])
+        self.ok(["gate", "U1", "critic", "pass"])
+        self.ok(["gate", "U1", "verifier", "pass"])
+        self.ok(["gate", "U1", "design-critic", "pass"])
+        self.ok(["human-verify", "U1", "--item", "0", "--fail", "--note", "still frenetic"])
+        self.fail(["integrate", "U1"], "FAILED")
+        self.ok(["reopen", "U1", "--reason", "human verify failed on sound feel"])
+        self.assertEqual(self.state_of("U1"), "dispatched")
+        # Calibration telemetry records the critic-pass/human-fail disagreement.
+        r = self.ok(["metrics"])
+        m = json.loads(r.stdout)
+        self.assertIn("U1", m["calibration"]["critic_pass_human_fail"])
+
+
 class TestGenesisRefusal(HarnessBase):
     def test_dispatch_blocked_until_walking_skeleton(self):
         self.ok(["init", "--mode", "genesis"])

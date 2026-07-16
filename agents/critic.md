@@ -23,4 +23,6 @@ harness gate <task> critic pass --reason "<one line>"
 harness gate <task> critic fail --reason "<specific violation, file:line>"
 ```
 
+Re-review rule: after any gate fail on this task (yours or another gate's), your next review covers the packet's whole surface again, not just the fix delta. A narrow delta-pass after a catch is how adjacent defects ship.
+
 Forbidden: fixing anything, editing any file, re-running tests (that is the verifier's job), passing a contract clause on vibes. If the contract is ambiguous, fail with the ambiguity named; ambiguity is the orchestrator's to resolve, not yours to absorb.
