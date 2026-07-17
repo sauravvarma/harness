@@ -605,6 +605,109 @@ class TestMetricsV3(HarnessBase):
         self.assertEqual(m["parks"], {"count": 0, "parked_minutes": 0.0})
 
 
+class TestNotes(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+
+    def test_note_and_list(self):
+        self.ok(["note", "watch the auth migration, security wants a second look"])
+        r = self.ok(["notes"])
+        self.assertIn("watch the auth migration", r.stdout)
+        self.assertIn("unread", r.stdout)
+
+    def test_empty_note_rejected(self):
+        self.fail(["note", "   "], "non-empty")
+
+    def test_unread_filter_and_ack(self):
+        self.ok(["note", "first"])
+        self.ok(["note", "second"])
+        note_seqs = [e["seq"] for e in self.ledger_events() if e["ev"] == "OPERATOR_NOTE"]
+        self.ok(["notes", "--ack", str(note_seqs[0])])
+        r = self.ok(["notes", "--unread"])
+        self.assertNotIn("first", r.stdout)
+        self.assertIn("second", r.stdout)
+        r = self.ok(["notes"])
+        self.assertIn("acked", r.stdout)
+
+    def test_ack_unknown_seq_rejected(self):
+        self.fail(["notes", "--ack", "999"], "not a note")
+
+    def test_ack_non_note_seq_rejected(self):
+        # seq 0 is the INIT event from setUp, not a note.
+        self.fail(["notes", "--ack", "0"], "not a note")
+
+    def test_no_notes_message(self):
+        r = self.ok(["notes"])
+        self.assertIn("no notes", r.stdout)
+
+
+class TestAnnotate(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+        write_json(self.root / "plan.json", BASIC_PLAN)
+        self.ok(["plan", "plan.json"])
+
+    def test_annotate_happy_path(self):
+        self.ok(["annotate", "T1", "--text", "acceptance flakiness traced to a network mock"])
+        ann = [e for e in self.ledger_events() if e["ev"] == "ANNOTATION"]
+        self.assertEqual(len(ann), 1)
+        self.assertEqual(ann[0]["subject"], "T1")
+        self.assertEqual(ann[0]["text"], "acceptance flakiness traced to a network mock")
+
+    def test_annotate_run_subject(self):
+        self.ok(["annotate", "run", "--text", "orchestrator misread the ready set once"])
+
+    def test_empty_text_rejected(self):
+        self.fail(["annotate", "T1", "--text", "   "], "non-empty")
+
+
+class TestShaGuard(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+        write_json(self.root / "plan.json", BASIC_PLAN)
+        self.ok(["plan", "plan.json"])
+        self.ok(["dispatch", "T1", "--agent", "builder-1"])
+        self.ok(["run-acceptance", "T1"])
+        rel = self.submit_done_digest("T1")
+        self.ok(["digest", "T1", rel])
+        self.ok(["gate", "T1", "critic", "pass"])
+        self.ok(["gate", "T1", "verifier", "pass"])
+        self.assertEqual(self.state_of("T1"), "done")
+
+    def head_sha(self):
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(self.root),
+                           capture_output=True, text=True, check=True)
+        return r.stdout.strip()
+
+    def test_truncated_sha_rejected(self):
+        truncated = self.head_sha()[:7]
+        self.fail(["integrate", "T1", "--sha", truncated], "40-character hex")
+        self.assertEqual(self.state_of("T1"), "done")
+        self.assertFalse(any(e["ev"] == "INTEGRATED" for e in self.ledger_events()))
+
+    def test_nonexistent_full_length_sha_rejected(self):
+        fake = "a" * 40
+        self.fail(["integrate", "T1", "--sha", fake], "does not name an existing")
+        self.assertFalse(any(e["ev"] == "INTEGRATED" for e in self.ledger_events()))
+
+    def test_valid_sha_accepted(self):
+        sha = self.head_sha()
+        self.ok(["integrate", "T1", "--sha", sha])
+        self.assertEqual(self.state_of("T1"), "integrated")
+        integrated = [e for e in self.ledger_events() if e["ev"] == "INTEGRATED"][0]
+        self.assertEqual(integrated["sha"], sha)
+
+    def test_default_sha_still_head(self):
+        # No-sha default (current HEAD) must survive the guard untouched.
+        self.ok(["integrate", "T1"])
+        self.assertEqual(self.state_of("T1"), "integrated")
+        integrated = [e for e in self.ledger_events() if e["ev"] == "INTEGRATED"][0]
+        self.assertEqual(integrated["sha"], self.head_sha())
+
+
 class TestGenesisRefusal(HarnessBase):
     def test_dispatch_blocked_until_walking_skeleton(self):
         self.ok(["init", "--mode", "genesis"])
