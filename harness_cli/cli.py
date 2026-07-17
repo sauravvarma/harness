@@ -9,6 +9,7 @@ All internal seams are UNSTABLE until the falsifiability clause fires.
 """
 
 import argparse
+import datetime
 import json
 import os
 import socket
@@ -33,6 +34,32 @@ DIGEST_STATUSES = (
     "scope-discovery",
     "budget-exceeded",
 )
+
+USAGE_ROLES = (
+    "orchestrator",
+    "builder",
+    "critic",
+    "verifier",
+    "design-critic",
+    "integrator",
+    "cartographer",
+    "plan-review",
+    "other",
+)
+
+HYPOTHESIS_SCHEMES = (
+    "solo-frontier",
+    "frontier-builders",
+    "sonnet-builders",
+    "single-session",
+    "other",
+)
+HYPOTHESIS_VERDICTS = ("likely-better", "unclear", "likely-worse")
+
+RISK_LEVELS = ("low", "standard", "high")
+
+# Orchestrator model guard: frontier ids contain one of these substrings.
+FRONTIER_MARKERS = ("fable", "opus")
 
 STATES = (
     "planned",
@@ -68,6 +95,16 @@ class HarnessError(Exception):
 
 def now():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def ts_epoch(ts):
+    """Parse a ledger timestamp back to epoch seconds."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(ts, fmt).timestamp()
+        except ValueError:
+            continue
+    raise HarnessError("unparseable ledger timestamp: %r" % ts)
 
 
 def find_root(start=None):
@@ -233,6 +270,17 @@ def decision_after(events, task, seq):
     )
 
 
+def open_park(events):
+    """The latest PARKED event with no later UNPARKED, or None."""
+    latest = None
+    for e in events:
+        if e["ev"] == "PARKED":
+            latest = e
+        elif e["ev"] == "UNPARKED":
+            latest = None
+    return latest
+
+
 # ---------------------------------------------------------------- commands
 
 
@@ -251,6 +299,17 @@ def cmd_init(args):
     if args.mode not in MODES:
         raise HarnessError("mode must be one of %s" % (MODES,))
 
+    model = args.orchestrator_model
+    non_frontier_ack = False
+    if model:
+        if not any(m in model.lower() for m in FRONTIER_MARKERS):
+            if not args.allow_non_frontier:
+                raise HarnessError(
+                    "orchestrator model %s is not frontier (expected an id containing %s); switch model or pass --allow-non-frontier"
+                    % (model, " or ".join(FRONTIER_MARKERS))
+                )
+            non_frontier_ack = True
+
     for sub in ("packets", "reports", "digests", "corpus"):
         (hd / sub).mkdir(parents=True, exist_ok=True)
 
@@ -265,6 +324,8 @@ def cmd_init(args):
         "host": socket.gethostname(),
         "harness_sha": harness_sha,
         "surface_versions": {"harness": harness_sha},
+        "orchestrator_model": model or "",
+        "non_frontier_ack": non_frontier_ack,
         "started": now(),
     }
     with open(hd / "session.json", "w") as f:
@@ -274,7 +335,9 @@ def cmd_init(args):
     with open(hd / "manifest.json", "w") as f:
         json.dump({"metrics": {}}, f, indent=2)
 
-    append_event(root, {"ev": "INIT", "mode": args.mode, "base_sha": git_sha(root), "task_type": args.task_type})
+    append_event(root, {"ev": "INIT", "mode": args.mode, "base_sha": git_sha(root),
+                        "task_type": args.task_type, "orchestrator_model": model or "",
+                        "non_frontier_ack": non_frontier_ack})
     print("initialized %s (mode=%s, operator=%s)" % (hd, args.mode, operator))
 
 
@@ -314,6 +377,13 @@ def cmd_plan(args):
     if not isinstance(tasks, list) or not tasks:
         raise HarnessError("plan must contain a non-empty tasks list")
 
+    defaults = plan.get("defaults", {})
+    if not isinstance(defaults, dict):
+        raise HarnessError("plan defaults must be an object")
+    default_builder = defaults.get("builder_model", "")
+    if not isinstance(default_builder, str):
+        raise HarnessError("defaults.builder_model must be a string")
+
     existing = task_defs(events)
     known_contracts = set()
     for e in events:
@@ -345,6 +415,14 @@ def cmd_plan(args):
             raise HarnessError(
                 "task %s: ui_surface tasks must carry the design-critic extra gate" % tid
             )
+        if t.get("risk", "standard") not in RISK_LEVELS:
+            raise HarnessError("task %s risk must be one of %s" % (tid, RISK_LEVELS))
+        if t.get("ui_surface") and t.get("risk") != "high":
+            raise HarnessError(
+                "task %s: ui_surface tasks must declare risk high explicitly" % tid
+            )
+        if not isinstance(t.get("builder_model", ""), str):
+            raise HarnessError("task %s builder_model must be a string" % tid)
         for c in t.get("contracts", []):
             if c not in known_contracts and c not in new_contracts:
                 raise HarnessError("task %s references undefined contract %s" % (tid, c))
@@ -362,7 +440,7 @@ def cmd_plan(args):
 
     wave = plan.get("wave", 1)
     ev_name = "PLAN_REVISED" if existing else "WAVE_PLANNED"
-    append_event(root, {"ev": ev_name, "wave": wave, "tasks": new_ids})
+    append_event(root, {"ev": ev_name, "wave": wave, "tasks": new_ids, "defaults": defaults})
     for cid, cdef in new_contracts.items():
         if cid in known_contracts:
             continue
@@ -381,6 +459,8 @@ def cmd_plan(args):
             "dep_gate": t.get("dep_gate", "integrated"),
             "ui_surface": bool(t.get("ui_surface")),
             "direction_adjacent": bool(t.get("direction_adjacent")),
+            "builder_model": t.get("builder_model") or default_builder,
+            "risk": t.get("risk", "standard"),
         })
     print("planned %d task(s) in wave %s: %s" % (len(new_ids), wave, ", ".join(new_ids)))
 
@@ -399,6 +479,13 @@ def _genesis_gate_ok(events):
 def cmd_dispatch(args):
     root = find_root()
     events = read_events(root)
+    # Parked check runs before the genesis and ready-set checks (C-PARK).
+    parked = open_park(events)
+    if parked:
+        raise HarnessError(
+            "run is parked since %s (%s); `harness unpark` before dispatching"
+            % (parked["ts"], parked.get("reason", ""))
+        )
     s = session(root)
     if s["mode"] == "genesis":
         ratified, corpus_pass = _genesis_gate_ok(events)
@@ -883,12 +970,64 @@ def cmd_checkout(args):
     print("checkout logged: %s" % args.path)
 
 
+def cmd_usage(args):
+    root = find_root()
+    events = read_events(root)
+    tid = args.task
+    if tid != "run" and tid not in task_defs(events):
+        raise HarnessError(
+            "task %s is not planned (use the literal `run` for orchestrator-level usage)" % tid
+        )
+    append_event(root, {"ev": "USAGE", "task": tid, "tokens": args.tokens,
+                        "duration_ms": args.duration_ms, "role": args.role,
+                        "model": args.model or "", "agent": args.agent or ""})
+    print("usage recorded for %s: %d tokens, %d ms (%s)"
+          % (tid, args.tokens, args.duration_ms, args.role))
+
+
+def cmd_hypothesis(args):
+    root = find_root()
+    events = read_events(root)
+    if args.task not in task_defs(events):
+        raise HarnessError("task %s is not planned" % args.task)
+    if not args.reason.strip():
+        raise HarnessError("hypothesis needs a non-empty --reason")
+    append_event(root, {"ev": "COUNTERFACTUAL", "task": args.task, "scheme": args.scheme,
+                        "verdict": args.verdict, "reason": args.reason})
+    print("hypothesis recorded for %s: %s -> %s" % (args.task, args.scheme, args.verdict))
+
+
+def cmd_park(args):
+    root = find_root()
+    events = read_events(root)
+    if not args.reason.strip():
+        raise HarnessError("park needs a non-empty --reason")
+    parked = open_park(events)
+    if parked:
+        raise HarnessError("run is already parked (since %s)" % parked["ts"])
+    append_event(root, {"ev": "PARKED", "reason": args.reason})
+    print("parked: %s" % args.reason)
+
+
+def cmd_unpark(args):
+    root = find_root()
+    events = read_events(root)
+    parked = open_park(events)
+    if parked is None:
+        raise HarnessError("run is not parked")
+    append_event(root, {"ev": "UNPARKED"})
+    print("unparked (was parked since %s)" % parked["ts"])
+
+
 def cmd_status(args):
     root = find_root()
     events = read_events(root)
     s = session(root)
     states = derive_states(events)
     defs = task_defs(events)
+    parked = open_park(events)
+    if parked:
+        print("PARKED since %s: %s" % (parked["ts"], parked.get("reason", "")))
     print("mode=%s operator=%s session=%s" % (s["mode"], s["operator"], s["session_id"][:8]))
     if not defs:
         print("no tasks planned")
@@ -948,6 +1087,33 @@ def cmd_metrics(args):
     human_failed = {e["task"] for e in hv_results if not e["passed"]}
     disagreements = sorted(critic_passed & human_failed)
 
+    usage_events = [e for e in events if e["ev"] == "USAGE"]
+    total_tokens = sum(e["tokens"] for e in usage_events)
+    tokens_by_role = {}
+    tokens_by_task = {}
+    for e in usage_events:
+        tokens_by_role[e["role"]] = tokens_by_role.get(e["role"], 0) + e["tokens"]
+        tokens_by_task[e["task"]] = tokens_by_task.get(e["task"], 0) + e["tokens"]
+
+    hypotheses = {}
+    for e in events:
+        if e["ev"] == "COUNTERFACTUAL":
+            by_verdict = hypotheses.setdefault(e["scheme"], {})
+            by_verdict[e["verdict"]] = by_verdict.get(e["verdict"], 0) + 1
+
+    # Parked minutes count closed PARKED/UNPARKED pairs only; an open park
+    # contributes zero and is surfaced by the status banner instead.
+    park_count = 0
+    parked_minutes = 0.0
+    park_open_ts = None
+    for e in events:
+        if e["ev"] == "PARKED":
+            park_count += 1
+            park_open_ts = e["ts"]
+        elif e["ev"] == "UNPARKED" and park_open_ts is not None:
+            parked_minutes += max(0.0, ts_epoch(e["ts"]) - ts_epoch(park_open_ts)) / 60.0
+            park_open_ts = None
+
     out = {
         "tasks": len(defs),
         "by_state": by_state,
@@ -972,6 +1138,17 @@ def cmd_metrics(args):
             "design_critic_gated_tasks": len(critic_passed),
             "critic_pass_human_fail": disagreements,
         },
+        "usage": {
+            "total_tokens": total_tokens,
+            "tokens_by_role": tokens_by_role,
+            "tokens_by_task": tokens_by_task,
+            "orchestrator_share": (
+                tokens_by_role.get("orchestrator", 0) / total_tokens
+                if total_tokens else None
+            ),
+        },
+        "hypotheses": hypotheses,
+        "parks": {"count": park_count, "parked_minutes": round(parked_minutes, 2)},
     }
     print(json.dumps(out, indent=2))
 
@@ -994,6 +1171,10 @@ def build_parser():
     sp.add_argument("--mode", default="standard", choices=MODES)
     sp.add_argument("--operator", default=None)
     sp.add_argument("--task-type", default="general")
+    sp.add_argument("--orchestrator-model", default=None,
+                    help="orchestrator model id; non-frontier ids refuse without --allow-non-frontier")
+    sp.add_argument("--allow-non-frontier", action="store_true",
+                    help="proceed with a non-frontier orchestrator model (recorded as non_frontier_ack)")
     sp.set_defaults(fn=cmd_init)
 
     sp = sub.add_parser("release", help="release the repo lease")
@@ -1077,6 +1258,29 @@ def build_parser():
     sp.add_argument("path")
     sp.add_argument("--reason", default="")
     sp.set_defaults(fn=cmd_checkout)
+
+    sp = sub.add_parser("usage", help="record token/duration telemetry for a task (or the literal `run`)")
+    sp.add_argument("task", help="task id, or `run` for orchestrator-level usage")
+    sp.add_argument("--tokens", type=int, required=True)
+    sp.add_argument("--duration-ms", type=int, required=True)
+    sp.add_argument("--role", required=True, choices=list(USAGE_ROLES))
+    sp.add_argument("--model", default="")
+    sp.add_argument("--agent", default="")
+    sp.set_defaults(fn=cmd_usage)
+
+    sp = sub.add_parser("hypothesis", help="record a counterfactual scheme hypothesis for a task")
+    sp.add_argument("task")
+    sp.add_argument("--scheme", required=True, choices=list(HYPOTHESIS_SCHEMES))
+    sp.add_argument("--verdict", required=True, choices=list(HYPOTHESIS_VERDICTS))
+    sp.add_argument("--reason", required=True)
+    sp.set_defaults(fn=cmd_hypothesis)
+
+    sp = sub.add_parser("park", help="park the run (dispatch refuses until unpark)")
+    sp.add_argument("--reason", required=True)
+    sp.set_defaults(fn=cmd_park)
+
+    sp = sub.add_parser("unpark", help="resume a parked run")
+    sp.set_defaults(fn=cmd_unpark)
 
     sp = sub.add_parser("direction", help="register the direction artifact required by ui_surface tasks")
     sp.add_argument("path")
