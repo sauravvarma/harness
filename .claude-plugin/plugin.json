@@ -1,7 +1,7 @@
 {
   "name": "harness",
   "displayName": "Orchestration Harness",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Multi-agent orchestration harness: a frontier-model orchestrator plans and governs while smaller delegatee agents execute packets, with a deterministic CLI as the sole ledger writer enforcing states, gates, escalations, and monotone metrics. The model proposes; the machine disposes.",
   "author": {
     "name": "Saurav Varma",
