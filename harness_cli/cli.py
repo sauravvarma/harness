@@ -270,6 +270,14 @@ def decision_after(events, task, seq):
     )
 
 
+def note_events(events):
+    return [e for e in events if e["ev"] == "OPERATOR_NOTE"]
+
+
+def acked_note_seqs(events):
+    return {e["note_seq"] for e in events if e["ev"] == "NOTE_ACK"}
+
+
 def open_park(events):
     """The latest PARKED event with no later UNPARKED, or None."""
     latest = None
@@ -871,8 +879,23 @@ def _integration_holds(root, events, tid, tdef):
     return holds
 
 
+def _validate_sha(root, sha):
+    """A recorded integration sha must be a full, resolvable git object id.
+
+    Refuses before any event is written; the no-sha default (current HEAD)
+    is untouched by this guard.
+    """
+    if len(sha) != 40 or any(c not in "0123456789abcdefABCDEF" for c in sha):
+        raise HarnessError("--sha must be a full 40-character hex sha, got %r" % sha)
+    r = subprocess.run(["git", "cat-file", "-e", sha], cwd=str(root), capture_output=True, text=True)
+    if r.returncode != 0:
+        raise HarnessError("--sha %s does not name an existing git object" % sha)
+
+
 def cmd_integrate(args):
     root = find_root()
+    if args.sha is not None:
+        _validate_sha(root, args.sha)
     events = read_events(root)
     tid = args.task
     if derive_states(events).get(tid) != "done":
@@ -968,6 +991,43 @@ def cmd_checkout(args):
     root = find_root()
     append_event(root, {"ev": "CHECKOUT", "path": args.path, "reason": args.reason or ""})
     print("checkout logged: %s" % args.path)
+
+
+def cmd_note(args):
+    root = find_root()
+    if not args.text.strip():
+        raise HarnessError("note needs non-empty text")
+    append_event(root, {"ev": "OPERATOR_NOTE", "text": args.text, "by": session(root)["operator"]})
+    print("note recorded")
+
+
+def cmd_notes(args):
+    root = find_root()
+    events = read_events(root)
+    if args.ack is not None:
+        note = next((n for n in note_events(events) if n["seq"] == args.ack), None)
+        if note is None:
+            raise HarnessError("seq %d is not a note" % args.ack)
+        append_event(root, {"ev": "NOTE_ACK", "note_seq": args.ack})
+        print("acked note %d" % args.ack)
+        return
+    acked = acked_note_seqs(events)
+    notes = note_events(events)
+    if args.unread:
+        notes = [n for n in notes if n["seq"] not in acked]
+    if not notes:
+        print("no notes")
+        return
+    for n in notes:
+        print("%-4d %-8s %s" % (n["seq"], "acked" if n["seq"] in acked else "unread", n["text"]))
+
+
+def cmd_annotate(args):
+    root = find_root()
+    if not args.text.strip():
+        raise HarnessError("annotate needs non-empty --text")
+    append_event(root, {"ev": "ANNOTATION", "subject": args.subject, "text": args.text})
+    print("annotation recorded for %s" % args.subject)
 
 
 def cmd_usage(args):
@@ -1216,7 +1276,8 @@ def build_parser():
 
     sp = sub.add_parser("integrate", help="integrate a done task (runs all registered metrics)")
     sp.add_argument("task")
-    sp.add_argument("--sha", default=None)
+    sp.add_argument("--sha", default=None,
+                    help="full 40-char hex sha naming an existing git object; defaults to current HEAD")
     sp.set_defaults(fn=cmd_integrate)
 
     sp = sub.add_parser("deploy", help="mark an integrated task deployed")
@@ -1258,6 +1319,21 @@ def build_parser():
     sp.add_argument("path")
     sp.add_argument("--reason", default="")
     sp.set_defaults(fn=cmd_checkout)
+
+    sp = sub.add_parser("note", help="append an out-of-band operator note (steers a busy run)")
+    sp.add_argument("text")
+    sp.set_defaults(fn=cmd_note)
+
+    sp = sub.add_parser("notes", help="list operator notes, filter unread, or ack one")
+    sp.add_argument("--unread", action="store_true", help="show only notes with no later NOTE_ACK")
+    sp.add_argument("--ack", type=int, default=None, metavar="SEQ",
+                    help="acknowledge the note at ledger seq SEQ")
+    sp.set_defaults(fn=cmd_notes)
+
+    sp = sub.add_parser("annotate", help="append a sanctioned correction/observation (never hand-edit the ledger)")
+    sp.add_argument("subject", help="task id, or `run` for run-level annotations")
+    sp.add_argument("--text", required=True)
+    sp.set_defaults(fn=cmd_annotate)
 
     sp = sub.add_parser("usage", help="record token/duration telemetry for a task (or the literal `run`)")
     sp.add_argument("task", help="task id, or `run` for orchestrator-level usage")
