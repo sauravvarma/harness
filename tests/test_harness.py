@@ -74,6 +74,20 @@ class HarnessBase(unittest.TestCase):
                 return parts[1]
         return None
 
+    def ledger_events(self):
+        events = []
+        with open(self.root / ".harness" / "ledger.jsonl") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
+        return events
+
+    def seed_event(self, ev):
+        """Append a raw event line, for tests that need controlled timestamps."""
+        with open(self.root / ".harness" / "ledger.jsonl", "a") as f:
+            f.write(json.dumps(ev) + "\n")
+
     def submit_done_digest(self, task):
         report = self.root / ".harness" / "reports" / ("%s.md" % task)
         report.parent.mkdir(parents=True, exist_ok=True)
@@ -253,7 +267,7 @@ UI_PLAN = {
     "tasks": [
         {"id": "U1", "goal": "hero tile rework", "deps": [], "acceptance": ["true"],
          "contracts": ["C1"], "ui_surface": True, "direction_adjacent": True,
-         "extra_gates": ["design-critic"]},
+         "extra_gates": ["design-critic"], "risk": "high"},
     ],
 }
 
@@ -360,6 +374,235 @@ class TestTasteLayer(HarnessBase):
         r = self.ok(["metrics"])
         m = json.loads(r.stdout)
         self.assertIn("U1", m["calibration"]["critic_pass_human_fail"])
+
+
+class TestUsageTelemetry(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+        write_json(self.root / "plan.json", BASIC_PLAN)
+        self.ok(["plan", "plan.json"])
+
+    def test_usage_recorded_and_rolled_up(self):
+        self.ok(["usage", "T1", "--tokens", "1200", "--duration-ms", "45000",
+                 "--role", "builder", "--model", "sonnet", "--agent", "builder-1"])
+        self.ok(["usage", "run", "--tokens", "800", "--duration-ms", "30000",
+                 "--role", "orchestrator"])
+        usage = [e for e in self.ledger_events() if e["ev"] == "USAGE"]
+        self.assertEqual(len(usage), 2)
+        self.assertEqual(usage[0]["task"], "T1")
+        self.assertEqual(usage[0]["tokens"], 1200)
+        self.assertEqual(usage[0]["duration_ms"], 45000)
+        self.assertEqual(usage[0]["role"], "builder")
+        self.assertEqual(usage[0]["model"], "sonnet")
+        self.assertEqual(usage[0]["agent"], "builder-1")
+        r = self.ok(["metrics"])
+        m = json.loads(r.stdout)
+        self.assertEqual(m["usage"]["total_tokens"], 2000)
+        self.assertEqual(m["usage"]["tokens_by_role"],
+                         {"builder": 1200, "orchestrator": 800})
+        self.assertEqual(m["usage"]["tokens_by_task"], {"T1": 1200, "run": 800})
+        self.assertAlmostEqual(m["usage"]["orchestrator_share"], 0.4)
+
+    def test_unknown_role_rejected(self):
+        self.fail(["usage", "T1", "--tokens", "1", "--duration-ms", "1",
+                   "--role", "wizard"], "invalid choice")
+
+    def test_unknown_task_rejected_run_exempt(self):
+        self.fail(["usage", "ZZ", "--tokens", "1", "--duration-ms", "1",
+                   "--role", "builder"], "not planned")
+        self.ok(["usage", "run", "--tokens", "1", "--duration-ms", "1",
+                 "--role", "orchestrator"])
+
+
+class TestHypothesis(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+        write_json(self.root / "plan.json", BASIC_PLAN)
+        self.ok(["plan", "plan.json"])
+
+    def test_hypothesis_recorded(self):
+        self.ok(["hypothesis", "T1", "--scheme", "solo-frontier",
+                 "--verdict", "likely-worse", "--reason", "gates caught two real defects"])
+        cf = [e for e in self.ledger_events() if e["ev"] == "COUNTERFACTUAL"]
+        self.assertEqual(len(cf), 1)
+        self.assertEqual(cf[0]["task"], "T1")
+        self.assertEqual(cf[0]["scheme"], "solo-frontier")
+        self.assertEqual(cf[0]["verdict"], "likely-worse")
+        self.assertEqual(cf[0]["reason"], "gates caught two real defects")
+
+    def test_bad_scheme_rejected(self):
+        self.fail(["hypothesis", "T1", "--scheme", "voodoo",
+                   "--verdict", "unclear", "--reason", "r"], "invalid choice")
+
+    def test_bad_verdict_rejected(self):
+        self.fail(["hypothesis", "T1", "--scheme", "other",
+                   "--verdict", "maybe", "--reason", "r"], "invalid choice")
+
+    def test_missing_or_empty_reason_rejected(self):
+        self.fail(["hypothesis", "T1", "--scheme", "other", "--verdict", "unclear"])
+        self.fail(["hypothesis", "T1", "--scheme", "other", "--verdict", "unclear",
+                   "--reason", "   "], "non-empty")
+
+
+class TestPark(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+        write_json(self.root / "plan.json", BASIC_PLAN)
+        self.ok(["plan", "plan.json"])
+
+    def test_banner_refusal_and_unpark(self):
+        self.ok(["park", "--reason", "rate limit cluster"])
+        r = self.ok(["status"])
+        self.assertIn("PARKED since", r.stdout)
+        self.assertIn("rate limit cluster", r.stdout)
+        self.fail(["dispatch", "T1", "--agent", "builder-1"], "parked")
+        self.ok(["unpark"])
+        r = self.ok(["status"])
+        self.assertNotIn("PARKED since", r.stdout)
+        self.ok(["dispatch", "T1", "--agent", "builder-1"])
+        self.assertEqual(self.state_of("T1"), "dispatched")
+
+    def test_parked_check_precedes_ready_set_check(self):
+        self.ok(["park", "--reason", "x"])
+        r = self.fail(["dispatch", "T2", "--agent", "builder-1"], "parked")
+        self.assertNotIn("ready set", r.stderr)
+
+    def test_double_park_and_stray_unpark_rejected(self):
+        self.fail(["unpark"], "not parked")
+        self.ok(["park", "--reason", "x"])
+        self.fail(["park", "--reason", "y"], "already parked")
+
+
+class TestParkPrecedence(HarnessBase):
+    def test_parked_check_precedes_genesis_gate(self):
+        self.ok(["init", "--mode", "genesis"])
+        write_json(self.root / "plan.json", {"tasks": [
+            {"id": "G1", "goal": "skeleton", "deps": [], "acceptance": ["true"]},
+        ]})
+        self.ok(["plan", "plan.json"])
+        self.ok(["park", "--reason", "x"])
+        r = self.fail(["dispatch", "G1", "--agent", "builder-1"], "parked")
+        self.assertNotIn("genesis", r.stderr)
+
+
+class TestModelGuard(HarnessBase):
+    def test_non_frontier_refused(self):
+        self.fail(["init", "--orchestrator-model", "claude-sonnet-4-5"],
+                  "--allow-non-frontier")
+        self.assertFalse((self.root / ".harness").exists())
+
+    def test_non_frontier_override_recorded(self):
+        self.ok(["init", "--orchestrator-model", "claude-sonnet-4-5",
+                 "--allow-non-frontier"])
+        with open(self.root / ".harness" / "session.json") as f:
+            header = json.load(f)
+        self.assertEqual(header["orchestrator_model"], "claude-sonnet-4-5")
+        self.assertTrue(header["non_frontier_ack"])
+        init_ev = [e for e in self.ledger_events() if e["ev"] == "INIT"][0]
+        self.assertEqual(init_ev["orchestrator_model"], "claude-sonnet-4-5")
+        self.assertTrue(init_ev["non_frontier_ack"])
+
+    def test_frontier_passes_through(self):
+        self.ok(["init", "--orchestrator-model", "claude-fable-5"])
+        with open(self.root / ".harness" / "session.json") as f:
+            header = json.load(f)
+        self.assertEqual(header["orchestrator_model"], "claude-fable-5")
+        self.assertFalse(header["non_frontier_ack"])
+
+    def test_frontier_match_is_case_insensitive_substring(self):
+        self.ok(["init", "--orchestrator-model", "Claude-Opus-4-8"])
+
+
+class TestPlanFields(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+
+    def plan(self, plan_obj):
+        write_json(self.root / "plan.json", plan_obj)
+        return harness(["plan", "plan.json"], self.root)
+
+    def test_defaults_and_override_recorded(self):
+        plan = {"defaults": {"builder_model": "opus"}, "tasks": [
+            {"id": "A", "goal": "a", "deps": [], "acceptance": ["true"]},
+            {"id": "B", "goal": "b", "deps": [], "acceptance": ["true"],
+             "builder_model": "sonnet", "risk": "low"},
+        ]}
+        r = self.plan(plan)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        events = self.ledger_events()
+        wave = [e for e in events if e["ev"] == "WAVE_PLANNED"][0]
+        self.assertEqual(wave["defaults"], {"builder_model": "opus"})
+        planned = {e["task"]: e for e in events if e["ev"] == "PLANNED"}
+        self.assertEqual(planned["A"]["builder_model"], "opus")
+        self.assertEqual(planned["A"]["risk"], "standard")
+        self.assertEqual(planned["B"]["builder_model"], "sonnet")
+        self.assertEqual(planned["B"]["risk"], "low")
+
+    def test_invalid_risk_rejected(self):
+        plan = {"tasks": [{"id": "A", "goal": "a", "deps": [], "acceptance": ["true"],
+                           "risk": "extreme"}]}
+        r = self.plan(plan)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("risk", r.stderr)
+
+    def test_ui_surface_requires_explicit_high_risk(self):
+        base = {"id": "U9", "goal": "ui", "deps": [], "acceptance": ["true"],
+                "ui_surface": True, "extra_gates": ["design-critic"]}
+        r = self.plan({"tasks": [dict(base)]})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("risk high", r.stderr)
+        r = self.plan({"tasks": [dict(base, risk="low")]})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("risk high", r.stderr)
+        r = self.plan({"tasks": [dict(base, risk="high")]})
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class TestMetricsV3(HarnessBase):
+    def setUp(self):
+        super().setUp()
+        self.ok(["init"])
+        write_json(self.root / "plan.json", BASIC_PLAN)
+        self.ok(["plan", "plan.json"])
+
+    def test_sections_and_arithmetic(self):
+        self.ok(["usage", "T1", "--tokens", "3000", "--duration-ms", "1000",
+                 "--role", "builder"])
+        self.ok(["usage", "run", "--tokens", "1000", "--duration-ms", "500",
+                 "--role", "orchestrator"])
+        self.ok(["hypothesis", "T1", "--scheme", "solo-frontier",
+                 "--verdict", "likely-worse", "--reason", "r1"])
+        self.ok(["hypothesis", "T2", "--scheme", "solo-frontier",
+                 "--verdict", "likely-worse", "--reason", "r2"])
+        self.ok(["hypothesis", "T1", "--scheme", "sonnet-builders",
+                 "--verdict", "unclear", "--reason", "r3"])
+        # Seeded park pair with controlled timestamps: 30 closed minutes,
+        # plus an open park that must contribute zero.
+        self.seed_event({"ev": "PARKED", "ts": "2026-07-18T10:00:00+0000", "reason": "429s"})
+        self.seed_event({"ev": "UNPARKED", "ts": "2026-07-18T10:30:00+0000"})
+        self.seed_event({"ev": "PARKED", "ts": "2026-07-18T11:00:00+0000", "reason": "still open"})
+        r = self.ok(["metrics"])
+        m = json.loads(r.stdout)
+        self.assertEqual(m["usage"]["total_tokens"], 4000)
+        self.assertEqual(m["usage"]["tokens_by_role"],
+                         {"builder": 3000, "orchestrator": 1000})
+        self.assertEqual(m["usage"]["tokens_by_task"], {"T1": 3000, "run": 1000})
+        self.assertAlmostEqual(m["usage"]["orchestrator_share"], 0.25)
+        self.assertEqual(m["hypotheses"],
+                         {"solo-frontier": {"likely-worse": 2},
+                          "sonnet-builders": {"unclear": 1}})
+        self.assertEqual(m["parks"], {"count": 2, "parked_minutes": 30.0})
+
+    def test_no_usage_means_null_share(self):
+        r = self.ok(["metrics"])
+        m = json.loads(r.stdout)
+        self.assertEqual(m["usage"]["total_tokens"], 0)
+        self.assertIsNone(m["usage"]["orchestrator_share"])
+        self.assertEqual(m["parks"], {"count": 0, "parked_minutes": 0.0})
 
 
 class TestGenesisRefusal(HarnessBase):
